@@ -3,7 +3,7 @@
 把音频转成文字，结合上下文纠正语音识别的错误，再按话题分部分并逐部分总结。
 
 **在线使用**：https://jamie-233.github.io/ai-transcribe/
-（Whisper 直接在浏览器里运行，音频不会上传；纠错与总结需要在“背景提示与参数”里填写 OpenAI 兼容的接口和 Key）
+（转写和纠错总结都可以完全在浏览器里运行，不需要 API Key，音频不会上传；需要支持 WebGPU 的 Chrome / Edge）
 
 ## 流程
 
@@ -34,12 +34,16 @@ python app.py             # 打开 http://127.0.0.1:8000
 | | 网页版（GitHub Pages） | 本地版（python app.py） | claude.ai Artifact |
 |---|---|---|---|
 | 音频转写 | 浏览器内 Whisper（transformers.js，支持 WebGPU） | faster-whisper / OpenAI API | 导入转写文件 |
-| 纠错与总结 | 你填写的 OpenAI 兼容接口 | 你配置的大模型 | Claude |
+| 纠错与总结 | 浏览器内 Qwen2.5（WebLLM，免 Key）或 OpenAI 兼容接口 | 你配置的大模型 | Claude |
 | 回放、校对、导出 | 支持 | 支持 | 支持 |
 
 也可以直接导入 Whisper 输出的 JSON（`verbose_json` 或 `whisper` 命令行的 `.json`）、SRT、VTT 或纯文本。
 
-网页版说明：第一次转写会下载模型（base 约 80 MB，之后浏览器缓存）；长音频在 CPU 上较慢，建议用支持 WebGPU 的 Chrome / Edge，或改用本地版。Key 只存在你自己的浏览器里。
+网页版说明：
+- 转写模型第一次下载约 80 MB（base），纠错模型 Qwen2.5 3B 约 2 GB，之后都从浏览器缓存加载。
+- 浏览器内大模型需要 WebGPU（新版 Chrome / Edge），显存建议 4 GB 以上；7B 需要约 6 GB。
+- 小模型纠错效果不如 API 或本地 14B 级模型，重要内容建议用“对比”视图逐条核对。
+- 选择“API 接口”时，Key 只保存在你自己的浏览器里；也可以填本地 Ollama（需设置 `OLLAMA_ORIGINS=https://jamie-233.github.io`）。
 
 ## 接口
 

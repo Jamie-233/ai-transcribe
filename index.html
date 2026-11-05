@@ -276,11 +276,29 @@ footer{margin-top:40px;color:var(--muted);font-size:12px}
           </div>
           <div id="webLLM" hidden>
             <div class="row">
-              <label class="f" style="flex-basis:100%">纠错模型接口（OpenAI 兼容）<input type="text" id="llmBase" placeholder="https://api.openai.com/v1" autocomplete="off"></label>
-              <label class="f">API Key<input type="password" id="llmKey" placeholder="sk-…" autocomplete="off"></label>
-              <label class="f">模型名<input type="text" id="llmModel" placeholder="gpt-4o-mini" autocomplete="off"></label>
+              <label class="f">纠错与总结用的模型<select id="llmSrc">
+                <option value="browser">浏览器内运行（免 Key，离线）</option>
+                <option value="api">API 接口（OpenAI / DeepSeek / Ollama）</option>
+              </select></label>
             </div>
-            <p class="hint" style="margin-top:6px">Key 只保存在这台浏览器里，直接发送到你填写的接口。DeepSeek 填 https://api.deepseek.com/v1 和 deepseek-chat。</p>
+            <div id="srcBrowser">
+              <div class="row">
+                <label class="f">本地模型<select id="wllmModel">
+                  <option value="Qwen2.5-3B-Instruct-q4f16_1-MLC">Qwen2.5 3B（约 2 GB，推荐）</option>
+                  <option value="Qwen2.5-7B-Instruct-q4f16_1-MLC">Qwen2.5 7B（约 5 GB，更准，需要较好的显卡）</option>
+                  <option value="Qwen2.5-1.5B-Instruct-q4f16_1-MLC">Qwen2.5 1.5B（约 1 GB，最快，效果一般）</option>
+                </select></label>
+              </div>
+              <p class="hint" style="margin-top:6px" id="wllmNote">第一次使用会下载模型，之后从浏览器缓存加载。需要支持 WebGPU 的 Chrome 或 Edge。</p>
+            </div>
+            <div id="srcApi" hidden>
+              <div class="row">
+                <label class="f" style="flex-basis:100%">接口地址（OpenAI 兼容）<input type="text" id="llmBase" placeholder="https://api.openai.com/v1" autocomplete="off"></label>
+                <label class="f">API Key<input type="password" id="llmKey" placeholder="sk-… 本地 Ollama 可留空" autocomplete="off"></label>
+                <label class="f">模型名<input type="text" id="llmModel" placeholder="gpt-4o-mini" autocomplete="off"></label>
+              </div>
+              <p class="hint" style="margin-top:6px">Key 只保存在这台浏览器里。DeepSeek：https://api.deepseek.com/v1 + deepseek-chat。Ollama：http://localhost:11434/v1 + qwen2.5:7b。</p>
+            </div>
           </div>
         </details>
       </div>
@@ -732,8 +750,37 @@ function webCfg(){return {base:($("#llmBase").value.trim()||"https://api.openai.
 function canLLM(){
   if(mode==="local")return !!(health&&health.llm&&health.llm.configured);
   if(mode==="claude")return true;
-  if(mode==="web"){const c=webCfg();return !!(c.key||/localhost|127\.0\.0\.1/.test(c.base))}
+  if(mode==="web"){
+    if($("#llmSrc").value==="browser")return !!navigator.gpu;
+    const c=webCfg();return !!(c.key||/localhost|127\.0\.0\.1/.test(c.base));
+  }
   return false;
+}
+function useBrowserLLM(){return mode==="web"&&$("#llmSrc").value==="browser"}
+function syncSrc(){const b=$("#llmSrc").value==="browser";$("#srcBrowser").hidden=!b;$("#srcApi").hidden=b;
+  if(b&&!navigator.gpu){$("#wllmNote").textContent="这个浏览器不支持 WebGPU，无法在浏览器内运行大模型。请用新版 Chrome / Edge，或改用 API 接口。";$("#wllmNote").style.color="var(--warn)"}}
+function saveCfg(){try{localStorage.setItem("ai-transcribe-llm",JSON.stringify({src:$("#llmSrc").value,wllm:$("#wllmModel").value,base:$("#llmBase").value.trim(),key:$("#llmKey").value.trim(),model:$("#llmModel").value.trim(),asr:$("#engine").value}))}catch(e){}}
+
+/* in-browser LLM via WebLLM (WebGPU) */
+let wllm=null,wllmId=null,wllmLoading=null;
+async function getWLLM(onStatus){
+  const id=$("#wllmModel").value;
+  if(wllm&&wllmId===id)return wllm;
+  if(wllmLoading)return wllmLoading;
+  wllmLoading=(async()=>{
+    if(worker){worker.terminate();worker=null}          // free GPU memory used by Whisper
+    if(wllm){try{await wllm.unload()}catch(e){}wllm=null}
+    const webllm=await import("https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.86/+esm");
+    const eng=await webllm.CreateMLCEngine(id,{initProgressCallback:r=>onStatus&&onStatus(r)},{context_window_size:8192});
+    wllm=eng;wllmId=id;return eng;
+  })();
+  try{return await wllmLoading}finally{wllmLoading=null}
+}
+function parseLoose(t){
+  try{return JSON.parse(t)}catch(e){}
+  const f=t.match(/```(?:json)?\s*([\s\S]*?)```/);if(f){try{return JSON.parse(f[1])}catch(e){}}
+  const a=t.indexOf("{"),b=t.lastIndexOf("}");if(a>=0&&b>a){try{return JSON.parse(t.slice(a,b+1))}catch(e){}}
+  throw {code:"invalid_json"};
 }
 function updateButtons(){
   const local=mode==="local"||mode==="web";
@@ -767,9 +814,12 @@ async function detect(){
     m.classList.add("on");$("#modeText").textContent="网页版 · 浏览器内运行 Whisper";
     $("#engine").innerHTML=`<option value="onnx-community/whisper-base">Whisper base（约 80 MB，较快）</option><option value="onnx-community/whisper-small">Whisper small（约 250 MB，更准）</option><option value="onnx-community/whisper-tiny">Whisper tiny（约 40 MB，最快）</option>`;
     $("#webLLM").hidden=false;
-    try{const c=JSON.parse(localStorage.getItem("ai-transcribe-llm")||"{}");$("#llmBase").value=c.base||"";$("#llmKey").value=c.key||"";$("#llmModel").value=c.model||"";if(c.asr)$("#engine").value=c.asr}catch(e){}
-    if(!canLLM())$("#settings").open=true;
-    ["llmBase","llmKey","llmModel","engine"].forEach(id=>$("#"+id).addEventListener("change",()=>{try{localStorage.setItem("ai-transcribe-llm",JSON.stringify({base:$("#llmBase").value.trim(),key:$("#llmKey").value.trim(),model:$("#llmModel").value.trim(),asr:$("#engine").value}))}catch(e){}updateButtons();render()}));
+    let c={};try{c=JSON.parse(localStorage.getItem("ai-transcribe-llm")||"{}")}catch(e){}
+    $("#llmSrc").value=c.src||(c.key?"api":(navigator.gpu?"browser":"api"));
+    if(c.wllm)$("#wllmModel").value=c.wllm;
+    $("#llmBase").value=c.base||"";$("#llmKey").value=c.key||"";$("#llmModel").value=c.model||"";if(c.asr)$("#engine").value=c.asr;
+    syncSrc();$("#settings").open=true;
+    ["llmSrc","wllmModel","llmBase","llmKey","llmModel","engine"].forEach(id=>$("#"+id).addEventListener("change",()=>{syncSrc();saveCfg();updateButtons();render()}));
   }
   else{$("#modeText").textContent="离线浏览 · 可查看、编辑与导出"}
   updateButtons();render();
@@ -781,17 +831,27 @@ async function llmJSON(prompt,signal){
     const r=await fetch("/api/llm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt}),signal});
     const j=await r.json().catch(()=>({}));if(!r.ok)throw {code:"local",message:j.detail||("HTTP "+r.status)};return j;
   }
+  if(useBrowserLLM()){
+    const prevStatus=$("#status").textContent;
+    const eng=await getWLLM(r=>setStatus(`加载浏览器内模型：${Math.round((r.progress||0)*100)}%（首次需要下载，之后从缓存读取）`));
+    if(signal&&signal.aborted)throw {code:"cancelled"};
+    setStatus(prevStatus);
+    const onAbort=()=>{try{eng.interruptGenerate()}catch(e){}};signal&&signal.addEventListener("abort",onAbort);
+    try{
+      const msgs=[{role:"system",content:"你是严谨的语音转写校对与摘要助手。只输出 JSON。"},{role:"user",content:prompt}];
+      let r;try{r=await eng.chat.completions.create({messages:msgs,temperature:0.2,max_tokens:1500,response_format:{type:"json_object"}})}
+      catch(e){if(signal&&signal.aborted)throw e;r=await eng.chat.completions.create({messages:msgs,temperature:0.2,max_tokens:1500})}
+      if(signal&&signal.aborted)throw {code:"cancelled"};
+      return parseLoose(r.choices[0].message.content||"");
+    }finally{signal&&signal.removeEventListener("abort",onAbort)}
+  }
   if(mode==="web"){
     const c=webCfg(),url=c.base+"/chat/completions";
     const body={model:c.model,temperature:0.2,messages:[{role:"system",content:"你是严谨的语音转写校对与摘要助手。只输出 JSON。"},{role:"user",content:prompt}]};
     const call=async rf=>{const r=await fetch(url,{method:"POST",signal,headers:Object.assign({"Content-Type":"application/json"},c.key?{Authorization:"Bearer "+c.key}:{}),body:JSON.stringify(rf?Object.assign({response_format:{type:"json_object"}},body):body)});
       const j=await r.json().catch(()=>({}));if(!r.ok)throw {code:"web",status:r.status,message:(j.error&&j.error.message)||("HTTP "+r.status)};return j};
     let j;try{j=await call(true)}catch(e){if(e&&e.status===400)j=await call(false);else throw e}
-    const t=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||"";
-    try{return JSON.parse(t)}catch(e){}
-    const f=t.match(/```(?:json)?\s*([\s\S]*?)```/);if(f){try{return JSON.parse(f[1])}catch(e){}}
-    const a=t.indexOf("{"),b=t.lastIndexOf("}");if(a>=0&&b>a)return JSON.parse(t.slice(a,b+1));
-    throw {code:"invalid_json"};
+    return parseLoose((j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||"");
   }
   if(sample)return await sample.json(prompt,{signal,modelTier:$("#tier").value,cache:false});
   throw {code:"unavailable",message:"没有可用的纠错模型"};
@@ -823,7 +883,7 @@ ${lines}
 sections 必须按顺序、不重叠地覆盖编号 ${first} 到 ${last} 的全部片段。`;
 }
 function makeChunks(segs){
-  const out=[];let cur=[],len=0;const maxLen=2400;
+  const out=[];let cur=[],len=0;const maxLen=useBrowserLLM()?1200:2400;
   for(const s of segs){if(cur.length&&(len+s.text.length>maxLen||cur.length>=80)){out.push(cur);cur=[];len=0}cur.push(s);len+=s.text.length+12}
   if(cur.length)out.push(cur);return out;
 }
@@ -960,7 +1020,7 @@ async function webASR(){
     if(e.name==="AbortError"||sig.aborted)setStatus("已停止转写，保留已识别的片段。");else setStatus("转写失败："+e.message,true);
     if(S.segments.length)S.asrDone=true;
   }finally{busy=false;ctl=null;save();render();updateButtons()}
-  if(S.asrDone&&canLLM()&&S.segments.length&&!S.processed)runLLM();
+  if(S.asrDone&&canLLM()&&S.segments.length&&!S.processed){if(useBrowserLLM()&&!wllm)setStatus(`转写完成，共 ${S.segments.length} 个片段。点击“纠错并总结”，首次会下载浏览器内模型。`);else runLLM()}
 }
 
 $("#asrBtn").onclick=async()=>{
