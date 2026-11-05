@@ -688,7 +688,8 @@ $("#fileAudio").onchange=e=>{const f=e.target.files[0];if(f)loadAudio(f);e.targe
 $("#fileText").onchange=e=>{const f=e.target.files[0];if(f)importText(f);e.target.value=""};
 ["dragenter","dragover"].forEach(ev=>document.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over")}));
 ["dragleave","drop"].forEach(ev=>document.addEventListener(ev,e=>{e.preventDefault();if(ev==="drop"||e.target===document.documentElement)drop.classList.remove("over")}));
-document.addEventListener("drop",e=>{drop.classList.remove("over");for(const f of e.dataTransfer.files){if(/^(audio|video)\//.test(f.type)||/\.(mp3|wav|m4a|aac|ogg|flac|webm|mp4|opus)$/i.test(f.name))loadAudio(f);else importText(f)}});
+const AUDIO_EXT=/\.(mp3|wav|m4a|m4b|aac|ogg|oga|flac|webm|mp4|m4v|mov|mkv|opus|amr|3gp|3g2|wma|aif|aiff|caf|mpga|mpeg)$/i;
+document.addEventListener("drop",e=>{drop.classList.remove("over");for(const f of e.dataTransfer.files){if(/^(audio|video)\//.test(f.type)||AUDIO_EXT.test(f.name))loadAudio(f);else importText(f)}});
 $("#loadSample").onclick=()=>{if(busy)return;S=fromSample();clearAudio();save();render();setStatus("已载入示例。");toast("已载入示例")};
 
 let audioFile=null;
@@ -703,18 +704,69 @@ function loadAudio(f){
   computePeaks(f);updateButtons();
   setStatus(mode==="local"||mode==="web"?"音频已载入，点击“开始转写”。":"音频已载入用于回放。在这个页面里不能直接运行 Whisper，请导入转写文件，或用本地版转写。");
 }
+/* what kind of bytes is this? audio by magic number, other binary, or text */
+function sniff(b){
+  const s=(o,str)=>[...str].every((ch,i)=>b[o+i]===ch.charCodeAt(0));
+  if((b[0]===0xFF&&b[1]===0xFE)||(b[0]===0xFE&&b[1]===0xFF))return "text";   // UTF-16 BOM
+  if(s(0,"ID3")||s(0,"RIFF")||s(0,"fLaC")||s(0,"OggS")||s(4,"ftyp")||s(0,"#!AMR")||s(0,"FORM")||s(0,"caff")||
+     (b[0]===0x1A&&b[1]===0x45&&b[2]===0xDF&&b[3]===0xA3)||(b[0]===0x30&&b[1]===0x26&&b[2]===0xB2&&b[3]===0x75)||
+     (b[0]===0xFF&&(b[1]&0xE0)===0xE0&&(b[1]&0x06)!==0))return "audio";
+  const n=Math.min(b.length,8192);let ctrl=0;
+  for(let i=0;i<n;i++){const c=b[i];if(c===0)return "binary";if(c<9||(c>13&&c<32))ctrl++}
+  return n&&ctrl/n>0.02?"binary":"text";
+}
+/* decode with the right encoding: UTF-8 first, then the common Chinese / Japanese ones */
+function decodeText(b){
+  if(b[0]===0xFF&&b[1]===0xFE)return {text:new TextDecoder("utf-16le").decode(b),enc:"UTF-16"};
+  if(b[0]===0xFE&&b[1]===0xFF)return {text:new TextDecoder("utf-16be").decode(b),enc:"UTF-16"};
+  try{return {text:new TextDecoder("utf-8",{fatal:true}).decode(b),enc:"UTF-8"}}catch(e){}
+  const score=t=>{const n=Math.min(t.length,20000);let good=0,bad=0;
+    for(let i=0;i<n;i++){const c=t.charCodeAt(i);
+      if(c===0xFFFD)bad+=5;
+      else if((c>=32&&c<127)||c===10||c===13||c===9||(c>=0x3000&&c<=0x30FF)||(c>=0x4E00&&c<=0x9FFF)||(c>=0xFF00&&c<=0xFFEF))good++;
+      else bad++}
+    return n?(good-bad)/n:0};
+  // Japanese text is full of hiragana; Chinese bytes read as Shift_JIS almost never produce it
+  try{
+    const t=new TextDecoder("shift_jis").decode(b),n=Math.min(t.length,20000);let hira=0,non=0,rep=0;
+    for(let i=0;i<n;i++){const c=t.charCodeAt(i);if(c>127){non++;if(c>=0x3041&&c<=0x309F)hira++;if(c===0xFFFD)rep++}}
+    if(non&&hira/non>0.15&&rep/non<0.01)return {text:t,enc:"Shift_JIS"};
+  }catch(e){}
+  let best=null;
+  for(const [enc,label] of [["gb18030","GBK"],["shift_jis","Shift_JIS"],["big5","Big5"],["euc-kr","EUC-KR"]]){
+    try{const t=new TextDecoder(enc).decode(b),sc=score(t);if(!best||sc>best.sc)best={text:t,enc:label,sc}}catch(e){}
+  }
+  return best||{text:new TextDecoder("utf-8").decode(b),enc:"UTF-8"};
+}
+/* Whisper sometimes loops ("好的好的好的…"); collapse long repeats */
+function squeeze(t){return String(t).replace(/(.{1,24}?)\1{3,}/g,"$1$1")}
+const tick=()=>new Promise(r=>setTimeout(r,0));
 async function importText(f){
   if(busy)return;
+  const mb=f.size/1048576;
+  busy="import";updateButtons();
+  $("#doc").innerHTML=`<div class="banner" style="margin-top:18px"><b>正在导入</b><span>${esc(f.name)} · ${mb<1?Math.ceil(f.size/1024)+" KB":mb.toFixed(1)+" MB"}</span></div>`;
+  setStatus(`正在读取 ${f.name}…`);setProg(.05);
   try{
-    const txt=await f.text();const d=parseTranscript(txt,f.name);
+    if(f.size>50*1048576&&!AUDIO_EXT.test(f.name))throw new Error("文件超过 50 MB，不像是转写文本。音频请用“选择音频”。");
+    const buf=new Uint8Array(await f.arrayBuffer());setProg(.3);await tick();
+    const kind=sniff(buf);
+    if(kind==="audio"){busy=false;setProg(0);loadAudio(f);toast("这是音频文件，已作为音频载入");return}
+    if(kind==="binary")throw new Error("这不是文本转写文件。音频请用“选择音频”；转写文件支持 Whisper JSON、SRT、VTT、TXT。");
+    setStatus("识别文字编码…");
+    const {text,enc}=decodeText(buf);setProg(.5);await tick();
+    setStatus(`解析中（编码 ${enc}）…`);
+    const d=parseTranscript(text,f.name);setProg(.8);await tick();
     if(!d.segments.length)throw new Error("文件里没有找到可用的转写内容");
     if(d.full){S=d.full}else{
+      d.segments.forEach(s=>s.text=squeeze(s.text));
       S=emptyDoc(f.name.replace(/\.[^.]+$/,""));S.segments=d.segments;S.language=d.language||"auto";S.estimated=d.estimated;S.asrDone=true;
       S.duration=S.segments[S.segments.length-1].end;
     }
-    curSeg=-1;save();render();updateButtons();
-    setStatus(`已导入 ${S.segments.length} 个片段。`+(canLLM()?"点击“纠错并总结”开始处理。":""));
-  }catch(e){setStatus("导入失败："+e.message,true)}
+    busy=false;curSeg=-1;save();render();updateButtons();setProg(1);
+    const chars=S.segments.reduce((a,s)=>a+s.text.length,0);
+    setStatus(`已导入 ${S.segments.length} 个片段，共 ${chars.toLocaleString()} 字（编码 ${enc}）。`+(canLLM()?"点击“纠错并总结”开始处理。":""));
+  }catch(e){busy=false;updateButtons();render();setProg(0);setStatus("导入失败："+e.message,true)}
 }
 function parseTime(s){const m=s.trim().replace(",",".").split(":").map(Number);return m.length===3?m[0]*3600+m[1]*60+m[2]:m.length===2?m[0]*60+m[1]:+m[0]}
 function parseTranscript(txt,name){
@@ -739,8 +791,20 @@ function parseTranscript(txt,name){
   }
   return plain(t);
 }
+function splitLong(p,max){
+  // break a run-on line at commas, then hard-wrap
+  if(p.length<=max)return [p];
+  const out=[];let cur="";
+  for(const piece of p.split(/(?<=[，、,；;：:])/)){
+    if((cur+piece).length>max&&cur){out.push(cur);cur=""}
+    cur+=piece;
+    while(cur.length>max){out.push(cur.slice(0,max));cur=cur.slice(max)}
+  }
+  if(cur)out.push(cur);return out;
+}
 function plain(t){
-  const parts=t.replace(/\r/g,"").split(/\n+|(?<=[。！？!?])\s*|(?<=[.!?])\s+/).map(s=>s.trim()).filter(Boolean);
+  const parts=t.replace(/\r/g,"").split(/\n+|(?<=[。！？!?])\s*|(?<=[.!?])\s+/).map(s=>s.trim()).filter(Boolean)
+    .flatMap(p=>splitLong(p,/[぀-鿿]/.test(p)?80:240));
   let cur=0;const segs=parts.map((p,i)=>{const cjk=/[぀-鿿]/.test(p);const d=Math.max(1.5,p.length/(cjk?4.5:15));const s={id:i,start:+cur.toFixed(2),end:+(cur+d).toFixed(2),text:p};cur+=d;return s});
   return {segments:segs,estimated:true};
 }
@@ -787,7 +851,7 @@ function updateButtons(){
   $("#asrRow").hidden=!local;$("#asrBtn").hidden=!local;
   $("#asrBtn").disabled=!!busy||!audioFile;
   $("#runBtn").disabled=!!busy||!canLLM()||!S.segments.length;
-  $("#stopBtn").hidden=!busy;
+  $("#stopBtn").hidden=!(busy==="asr"||busy==="llm");
   $("#tierWrap").hidden=mode!=="claude";
   $("#loadSample").disabled=!!busy;
 }
@@ -960,7 +1024,7 @@ self.onmessage = async (e) => {
         dev = gpu ? "webgpu" : "wasm";
         asr = await pipeline("automatic-speech-recognition", m.model, {
           device: dev,
-          dtype: gpu ? { encoder_model: "fp32", decoder_model_merged: "q4" } : "q8",
+          dtype: gpu ? { encoder_model: "fp32", decoder_model_merged: "q4" } : { encoder_model: "fp32", decoder_model_merged: "q8" },
           progress_callback: (p) => self.postMessage({ type: "progress", p })
         });
         cur = m.model;
@@ -1010,7 +1074,7 @@ async function webASR(){
       const slice=data.slice(start,end),off=start/SR,winEnd=end/SR;
       setStatus(`识别中（${ready.device==="webgpu"?"GPU":"CPU"}）… ${fmt(off)} / ${fmt(S.duration)}`);
       const r=await ask({type:"run",audio:slice,language},[slice.buffer]);
-      for(const c of r.chunks){const text=String(c.text||"").trim();if(!text)continue;
+      for(const c of r.chunks){const text=squeeze(String(c.text||"").trim());if(!text||/^[\s\p{P}]*$/u.test(text))continue;
         const s0=off+(c.timestamp&&c.timestamp[0]||0),s1=c.timestamp&&c.timestamp[1]!=null?off+c.timestamp[1]:winEnd;
         S.segments.push({id:S.segments.length,start:+s0.toFixed(2),end:+Math.min(winEnd,Math.max(s0+.3,s1)).toFixed(2),text})}
       start=end;setProg(.15+.85*start/data.length);render();
@@ -1038,7 +1102,7 @@ $("#asrBtn").onclick=async()=>{
     for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
       let i;while((i=buf.indexOf("\n"))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line)continue;const m=JSON.parse(line);
         if(m.type==="info"){S.language=m.language||S.language;S.duration=m.duration||duration();setStatus(`识别中… 语言：${m.language||"自动"}`)}
-        else if(m.type==="segment"){S.segments.push({id:S.segments.length,start:m.start,end:m.end,text:m.text});const D=S.duration||duration();setProg(D?m.end/D:.5);setStatus(`识别中… ${fmt(m.end)} / ${fmt(D)}`);if(Date.now()-lastR>400){render();lastR=Date.now()}}
+        else if(m.type==="segment"){S.segments.push({id:S.segments.length,start:m.start,end:m.end,text:squeeze(m.text)});const D=S.duration||duration();setProg(D?m.end/D:.5);setStatus(`识别中… ${fmt(m.end)} / ${fmt(D)}`);if(Date.now()-lastR>400){render();lastR=Date.now()}}
         else if(m.type==="error")throw new Error(m.message);
       }}
     S.asrDone=true;setProg(1);setStatus(`转写完成，共 ${S.segments.length} 个片段。`+(canLLM()?"接着运行纠错与总结。":"未配置纠错模型，见 README。"));
